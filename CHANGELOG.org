@@ -2,6 +2,12 @@
 #+author: Michael Russo
 #+language: en
 
+* Version 0.6 (2025-11-12)
+
+- Prevent async completions from rendering in the wrong buffer
+- Enable auto-FIM to be triggered in modes that use custom insertion commands (such as `org-mode`)
+- Fix: include bearer token when making API requests to authenticated llama.cpp servers
+
 * Version 0.5 (2025-07-31)
 
 - Add *"Emulated FIM"* completion mode:
