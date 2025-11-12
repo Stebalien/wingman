@@ -512,43 +512,43 @@ Log a warning if truncation occurs. Return the potentially truncated line."
   "Main completion routine. If AUTO is non-nil, then this is an automatic trigger."
   (cl-block wingman--fim
     (wingman--log 3 "wingman--fim called (auto=%s)" auto)
+    (let ((pos-marker (copy-marker (point) t)))
+      (when (and wingman--current-request auto)
+        (wingman--log 3 "Debouncing: request in flight.")
 
-    (when (and wingman--current-request auto)
-      (wingman--log 3 "Debouncing: request in flight.")
+        (when (timerp wingman--debounce-timer)
+          (cancel-timer wingman--debounce-timer))
 
+        (setq wingman--debounce-timer
+              (run-at-time 0.1 nil #'wingman--fim auto))
+
+        (cl-return-from wingman--fim))
+
+      ;; If we are proceeding, it means no request is in-flight.
+      ;; We must cancel any pending debounce timer that might have been
+      ;; scheduled before the previous request completed.
       (when (timerp wingman--debounce-timer)
-        (cancel-timer wingman--debounce-timer))
+        (cancel-timer wingman--debounce-timer)
+        (setq wingman--debounce-timer nil))
 
-      (setq wingman--debounce-timer
-            (run-at-time 0.1 nil #'wingman--fim auto))
+      (let* ((ctx  (wingman--collect-local-context))
+             (pre  (alist-get 'prefix ctx))
+             (mid  (alist-get 'middle ctx))
+             (suf  (alist-get 'suffix ctx))
+             (indent (alist-get 'indent ctx))
+             (hash  (wingman--sha256 (concat pre mid wingman--marker suf))))
 
-      (cl-return-from wingman--fim))
-
-    ;; If we are proceeding, it means no request is in-flight.
-    ;; We must cancel any pending debounce timer that might have been
-    ;; scheduled before the previous request completed.
-    (when (timerp wingman--debounce-timer)
-      (cancel-timer wingman--debounce-timer)
-      (setq wingman--debounce-timer nil))
-
-    (let* ((ctx  (wingman--collect-local-context))
-           (pre  (alist-get 'prefix ctx))
-           (mid  (alist-get 'middle ctx))
-           (suf  (alist-get 'suffix ctx))
-           (indent (alist-get 'indent ctx))
-           (hash  (wingman--sha256 (concat pre mid wingman--marker suf))))
-
-      (wingman--log 3 "Context: prefix=%d chars, middle='%s', suffix=%d chars"
-                    (length pre) (truncate-string-to-width mid 20 nil nil t) (length suf))
-      (if-let ((cached (wingman--cache-get hash)))
+        (wingman--log 3 "Context: prefix=%d chars, middle='%s', suffix=%d chars"
+                      (length pre) (truncate-string-to-width mid 20 nil nil t) (length suf))
+        (if-let ((cached (wingman--cache-get hash)))
+            (progn
+              (wingman--log 2 "Cache HIT for hash %s" (substring hash 0 8))
+              (wingman--render cached indent (current-buffer) pos-marker))
           (progn
-            (wingman--log 2 "Cache HIT for hash %s" (substring hash 0 8))
-            (wingman--render cached indent (current-buffer)))
-        (progn
-          (wingman--log 2 "Cache MISS for hash %s - making HTTP request" (substring hash 0 8))
-          (wingman--http-request ctx indent (list hash) (current-buffer)))))))
+            (wingman--log 2 "Cache MISS for hash %s - making HTTP request" (substring hash 0 8))
+            (wingman--http-request ctx indent (list hash) (current-buffer) pos-marker)))))))
 
-(defun wingman--http-request (ctx indent hashes origin-buffer)
+(defun wingman--http-request (ctx indent hashes origin-buffer pos-marker)
   "Send asynchronous HTTP request; store HANDLE in `wingman--current-request'."
   (wingman--log 2 "HTTP → prefix:%d chars, suffix:%d chars, hashes:%d"
                 (length (alist-get 'prefix ctx))
@@ -580,35 +580,35 @@ Log a warning if truncation occurs. Return the potentially truncated line."
                           (when wingman-llama-api-key
                             `(("Authorization" . ,(concat "Bearer " wingman-llama-api-key))))))
          (data (json-encode payload)))
-    (setq wingman--current-request
-          (request
-            url
-            :type "POST"
-            :headers headers
-            :data data
-            :parser 'buffer-string
-            :success (cl-function
-                      (lambda (&key data &allow-other-keys)
-                        (if (and (buffer-live-p origin-buffer)
-                                 (eq (current-buffer) origin-buffer))
-                            (progn
-                              (wingman--log 2 "HTTP ← %d bytes, caching under %d hashes"
-                                            (length data) (length hashes))
-                              (dolist (h hashes)
-                                (wingman--cache-put h data))
-                              (wingman--render data indent origin-buffer))
-                          (cond
-                           ((not (buffer-live-p origin-buffer))
-                            (wingman--log 3 "Ignoring stale completion: origin buffer '%s' was killed."
-                                          (buffer-name origin-buffer)))
-                           ((not (eq (current-buffer) origin-buffer))
-                            (wingman--log 3 "Ignoring stale completion: buffer changed from '%s' to '%s'."
-                                          (buffer-name origin-buffer)
-                                          (buffer-name (current-buffer))))))))
-            :error (cl-function
-                    (lambda (&rest args &key error-thrown &allow-other-keys)
-                      (wingman--log 1 "HTTP ERROR: %S" error-thrown)))
-            :complete (lambda (&rest _) (setq wingman--current-request nil))))))
+    (when (buffer-live-p origin-buffer)
+      (with-current-buffer origin-buffer
+        (when wingman--current-request
+          (request-abort wingman--current-request))))
+    (when (buffer-live-p origin-buffer)
+      (with-current-buffer origin-buffer
+        (setq wingman--current-request
+              (request
+                url
+                :type "POST"
+                :headers headers
+                :data data
+                :parser 'buffer-string
+                :success (cl-function
+                          (lambda (&key data &allow-other-keys)
+                            (when (buffer-live-p origin-buffer)
+                              (with-current-buffer origin-buffer
+                                (wingman--log 2 "HTTP ← %d bytes, caching under %d hashes"
+                                              (length data) (length hashes))
+                                (dolist (h hashes)
+                                  (wingman--cache-put h data))
+                                (wingman--render data indent origin-buffer pos-marker)))))
+                :error (cl-function
+                        (lambda (&rest args &key error-thrown &allow-other-keys)
+                          (wingman--log 1 "HTTP ERROR: %S" error-thrown)))
+                :complete (lambda (&rest _)
+                            (when (buffer-live-p origin-buffer)
+                              (with-current-buffer origin-buffer
+                                (setq wingman--current-request nil))))))))))
 
 (defun wingman--extra-context (&optional ctx)
   "Return a vector of alists representing chunks from the ring buffer.
@@ -652,8 +652,9 @@ filtering is performed."
                  (filename . ,(wingman--chunk-filename c))))
              filtered-chunks))))
 
-(defun wingman--render (raw indent buf)
-  "Display RAW JSON as ghost text overlay, handling partial text."
+(defun wingman--render (raw indent buf &optional pos-marker)
+  "Display RAW JSON as ghost text overlay in BUF, handling partial text.
+If POS-MARKER is non-nil, render at that marker position."
   (cl-block wingman--render
     (let ((resp (ignore-errors (json-read-from-string raw))))
       (unless resp
@@ -672,61 +673,65 @@ filtering is performed."
           (wingman--log 3 "Received empty or no content from server. Aborting render.")
           (cl-return-from wingman--render))
 
-        (wingman-hide) ; Clear previous overlays.
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            ;; Clear previous overlays in the correct buffer.
+            (wingman-hide buf)
 
-        (let* ((pos (point))
-               (current-suffix (buffer-substring-no-properties pos (line-end-position)))
-               (first-line (car content-lines))
-               (remaining-lines (cdr content-lines))
-               (accept-content-lines (copy-sequence content-lines))
+            (let* ((pos (let ((p (if (and pos-marker (markerp pos-marker))
+                                     (marker-position pos-marker)
+                                   (point))))
+                          (min (max (point-min) p) (point-max))))
+                   (line-end (save-excursion
+                               (goto-char (min (max (point-min) pos) (point-max)))
+                               (line-end-position)))
+                   (current-suffix (buffer-substring-no-properties pos line-end))
+                   (first-line (car content-lines))
+                   (remaining-lines (cdr content-lines))
+                   (accept-content-lines (copy-sequence content-lines))
+                   (common-prefix (wingman--string-common-prefix first-line current-suffix))
+                   (display-first-line (substring first-line (length common-prefix)))
+                   (first-ov (make-overlay pos pos buf))
+                   (multi-ov (when remaining-lines (make-overlay pos pos buf))))
 
-               ;; Find what part of the completion is *not* already typed.
-               (common-prefix (wingman--string-common-prefix first-line current-suffix))
-               (display-first-line (substring first-line (length common-prefix)))
+              ;; If there is nothing new to display on the first line and no other lines, do nothing.
+              (when (or (not (string-empty-p display-first-line)) remaining-lines)
+                (wingman--log 2 "Rendering hint: %s... (%d lines)"
+                              (truncate-string-to-width (car content-lines) 50)
+                              (length content-lines))
 
-               ;; Create a zero-width overlay at point for the first line hint.
-               (first-ov (make-overlay pos pos buf))
-               ;; Create a second overlay for any subsequent lines.
-               (multi-ov (when remaining-lines (make-overlay pos pos buf))))
+                ;; Append the existing text (after the cursor) to the last line of the suggestion.
+                (when (and accept-content-lines (not (string-empty-p current-suffix)))
+                  (setcar (last accept-content-lines)
+                          (concat (car (last accept-content-lines)) current-suffix)))
 
-          ;; If there is nothing new to display on the first line and no other lines, do nothing.
-          (when (or (not (string-empty-p display-first-line)) remaining-lines)
-            (wingman--log 2 "Rendering hint: %s... (%d lines)"
-                          (truncate-string-to-width (car content-lines) 50)
-                          (length content-lines))
+                (overlay-put first-ov 'after-string (propertize display-first-line 'face 'wingman-overlay-face))
+                (overlay-put first-ov 'wingman t)
+                (setq wingman--hint-overlay first-ov)
 
-            ;; Append the existing text (after the cursor) to the last line of
-            ;; the suggestion. See: <https://github.com/mjrusso/wingman/issues/2>
-            (when (and accept-content-lines (not (string-empty-p current-suffix)))
-              (setcar (last accept-content-lines)
-                      (concat (car (last accept-content-lines)) current-suffix)))
+                (when multi-ov
+                  (let ((multi-display
+                         (concat "\n"
+                                 (mapconcat (lambda (line) (propertize line 'face 'wingman-overlay-face))
+                                            remaining-lines
+                                            "\n"))))
+                    (overlay-put multi-ov 'after-string multi-display)
+                    (overlay-put multi-ov 'wingman t)
+                    (setq wingman--info-overlay multi-ov)))
+                (setq wingman--content-lines accept-content-lines)
+                (set-transient-map wingman-mode-completion-transient-map t)))))))))
 
-            (overlay-put first-ov 'after-string (propertize display-first-line 'face 'wingman-overlay-face))
-            (overlay-put first-ov 'wingman t)
-            (setq wingman--hint-overlay first-ov)
-
-            (when multi-ov
-              (let ((multi-display
-                     (concat "\n"
-                             (mapconcat (lambda (line) (propertize line 'face 'wingman-overlay-face))
-                                        remaining-lines
-                                        "\n"))))
-                (overlay-put multi-ov 'after-string multi-display)
-                (overlay-put multi-ov 'wingman t)
-                (setq wingman--info-overlay multi-ov)))
-            (setq wingman--content-lines accept-content-lines)
-            (set-transient-map wingman-mode-completion-transient-map t)))))))
-
-(defun wingman-hide ()
-  "Clear existing hint overlays and detach accept keys."
+(defun wingman-hide (&optional buf)
+  "Clear existing hint overlays in BUF (or current buffer) and detach accept keys."
   (interactive)
-  (when (overlayp wingman--hint-overlay)
-    (delete-overlay wingman--hint-overlay)
-    (setq wingman--hint-overlay nil))
-  (when (overlayp wingman--info-overlay)
-    (delete-overlay wingman--info-overlay)
-    (setq wingman--info-overlay nil))
-  (setq wingman--content-lines nil))
+  (with-current-buffer (or buf (current-buffer))
+    (when (overlayp wingman--hint-overlay)
+      (delete-overlay wingman--hint-overlay)
+      (setq wingman--hint-overlay nil))
+    (when (overlayp wingman--info-overlay)
+      (delete-overlay wingman--info-overlay)
+      (setq wingman--info-overlay nil))
+    (setq wingman--content-lines nil)))
 
 (defun wingman-accept-full ()
   "Accept the full suggestion."
@@ -1160,7 +1165,7 @@ suffix like '-mode' or '-ts-mode'."
         (wingman--log 3 "Received empty or no content from LLM. Aborting render.")
         (cl-return-from wingman--gptel-render))
 
-      (wingman-hide)
+      (wingman-hide buf)
 
       (with-current-buffer buf
         (let* ((pos (point))
