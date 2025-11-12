@@ -350,6 +350,7 @@ the `wingman-mode-map' map."
         (progn
           (cl-pushnew (current-buffer) wingman--active-buffers)
           (add-hook 'post-command-hook #'wingman--on-point-move nil t)
+          (add-hook 'post-self-insert-hook #'wingman--on-self-insert nil t)
           (add-hook 'after-save-hook #'wingman--pick-chunk-on-save nil t)
           (add-hook 'yank-post-process-hook #'wingman--pick-chunk-on-yank nil t)
           (add-hook 'kill-buffer-hook #'wingman--cleanup nil t)
@@ -358,6 +359,7 @@ the `wingman-mode-map' map."
     (progn
       (setq wingman--active-buffers (delq (current-buffer) wingman--active-buffers))
       (remove-hook 'post-command-hook #'wingman--on-point-move t)
+      (remove-hook 'post-self-insert-hook #'wingman--on-self-insert t)
       (remove-hook 'after-save-hook #'wingman--pick-chunk-on-save t)
       (remove-hook 'yank-post-process-hook #'wingman--pick-chunk-on-yank t)
       (remove-hook 'kill-buffer-hook #'wingman--cleanup t)
@@ -476,23 +478,29 @@ Log a warning if truncation occurs. Return the potentially truncated line."
 (defalias 'wingman-fim-inline 'wingman-fim)
 (make-obsolete 'wingman-fim-inline 'wingman-fim "1.0")
 
+(defun wingman--on-self-insert ()
+  "Auto-trigger FIM after an insertion, subject to suffix length guard."
+  (unless (or wingman--accepting-completion-p
+              ;; Don't trigger if we're accepting a completion or running other
+              ;; wingman commands.
+              (and (symbolp this-command)
+                   (string-prefix-p "wingman-" (symbol-name this-command))))
+    (when wingman-auto-fim
+      (let ((suffix-len (length (buffer-substring-no-properties (point) (line-end-position)))))
+        (wingman--log 4 "Auto-FIM (self-insert): suffix-len=%d, max=%d" suffix-len wingman-max-line-suffix)
+        (when (<= suffix-len wingman-max-line-suffix)
+          (wingman--log 3 "Auto-triggering FIM (self-insert)")
+          (wingman--fim t))))))
+
 (defun wingman--on-point-move ()
-  "Hide hint on movement; possibly auto-trigger a new one."
+  "Hide hint on movement; timing bookkeeping."
   (unless (or wingman--accepting-completion-p
               (and (symbolp this-command)
                    (string-prefix-p "wingman-" (symbol-name this-command))))
     (setq wingman--last-move-time (current-time))
-
     (when (or (overlayp wingman--hint-overlay) (overlayp wingman--info-overlay))
       (wingman--log 3 "Hiding overlay due to point movement (command: %s)" this-command)
-      (wingman-hide))
-
-    (when (and wingman-auto-fim (eq this-command 'self-insert-command))
-      (let ((suffix-len (length (buffer-substring-no-properties (point) (line-end-position)))))
-        (wingman--log 4 "Auto-FIM check: suffix-len=%d, max=%d" suffix-len wingman-max-line-suffix)
-        (when (<= suffix-len wingman-max-line-suffix)
-          (wingman--log 3 "Auto-triggering FIM")
-          (wingman--fim t))))))
+      (wingman-hide))))
 
 (defun wingman--sha256 (string)
   (secure-hash 'sha256 string nil nil t))
