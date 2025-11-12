@@ -578,7 +578,7 @@ Log a warning if truncation occurs. Return the potentially truncated line."
          (url wingman-llama-endpoint)
          (headers (append '(("Content-Type" . "application/json"))
                           (when wingman-llama-api-key
-                            `(("Authorization" . ,(concat "Bearer " wingman-api-key))))))
+                            `(("Authorization" . ,(concat "Bearer " wingman-llama-api-key))))))
          (data (json-encode payload)))
     (setq wingman--current-request
           (request
